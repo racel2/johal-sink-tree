@@ -63,7 +63,8 @@ ENLACES_BASE = [
 MODO_SALTOS = "Johal: mínimo de saltos"
 MODO_RETARDO = "Mínimo retardo"
 MODO_MULTI = "Multicriterio (α, β, γ)"
-MODOS = [MODO_SALTOS, MODO_RETARDO, MODO_MULTI]
+MODO_ADAPT = "Adaptativo (enlaces + routers)"
+MODOS = [MODO_SALTOS, MODO_RETARDO, MODO_MULTI, MODO_ADAPT]
 
 
 # ----------------------------------------------------------------------------
@@ -88,6 +89,10 @@ ESCENARIOS = {
         ("H", "O"): {"Banda_Mbps": 100},
     },
 }
+ESC_ADAPT = "Adaptativo: routers D y A congestionados"
+ESCENARIOS[ESC_ADAPT] = {}
+# Peso_router por escenario (los routers no listados quedan en 0)
+ESCENARIOS_ROUTERS = {ESC_ADAPT: {"D": 10.0, "A": 10.0, "E": 1.0, "J": 1.0}}
 NOMBRES_ESCENARIOS = list(ESCENARIOS.keys())
 
 
@@ -103,6 +108,25 @@ def tabla_inicial(escenario: str = "Base (datos del artículo)") -> pd.DataFrame
         for col, valor in cambios.items():
             df.loc[fila, col] = valor
     return df
+
+
+def tabla_routers(escenario: str = "Base (datos del artículo)") -> pd.DataFrame:
+    pesos = ESCENARIOS_ROUTERS.get(escenario, {})
+    return pd.DataFrame({
+        "Router": NODOS,
+        "Peso_router": [float(pesos.get(n, 0.0)) for n in NODOS],
+        "Disponible": True,
+    })
+
+
+def limpiar_routers(dfr: pd.DataFrame):
+    dfr = dfr.copy()
+    dfr["Peso_router"] = pd.to_numeric(dfr["Peso_router"], errors="coerce")
+    dfr["Disponible"] = dfr["Disponible"].fillna(False).astype(bool)
+    errores = []
+    if dfr["Peso_router"].isna().any() or (dfr["Peso_router"] < 0).any():
+        errores.append("Peso_router debe ser numérico y no negativo.")
+    return dfr, errores
 
 
 def limpiar_tabla(df: pd.DataFrame):
@@ -128,12 +152,15 @@ def referencias(df: pd.DataFrame):
     return d_ref, b_ref
 
 
-def normalizar_pesos(alfa, beta, gamma):
-    """Normaliza dividiendo cada peso entre la suma. Devuelve (a, b, g, suma_nula)."""
-    s = alfa + beta + gamma
+def normalizar_pesos(alfa, beta, gamma, delta=None):
+    """Divide cada peso entre la suma. delta=None: δ no se usa (modo multicriterio).
+    Devuelve (α, β, γ, δ, suma_nula)."""
+    d = 0.0 if delta is None else delta
+    s = alfa + beta + gamma + d
     if s <= 0:
-        return 1 / 3, 1 / 3, 1 / 3, True
-    return alfa / s, beta / s, gamma / s, False
+        k = 3 if delta is None else 4
+        return 1 / k, 1 / k, 1 / k, (0.0 if delta is None else 1 / k), True
+    return alfa / s, beta / s, gamma / s, d / s, False
 
 
 def costo_arista(d, b, alfa, beta, gamma, d_ref, b_ref):
@@ -143,27 +170,48 @@ def costo_arista(d, b, alfa, beta, gamma, d_ref, b_ref):
     return alfa + beta * (d / d_ref) + gamma * (b_ref / b)
 
 
-def dic_enlaces(df: pd.DataFrame) -> dict:
-    return {
+class Red(dict):
+    """Enlaces {frozenset({u,v}): {d, b, f}} más pesos de routers y δ (modo adaptativo)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.routers = {}
+        self.delta = 0.0
+        self.w_ref = 1.0
+
+
+def dic_enlaces(df: pd.DataFrame, pesos_routers=None, delta=0.0) -> Red:
+    red = Red({
         frozenset((r.Origen, r.Destino)): {
             "d": float(r.Retardo_ms),
             "b": float(r.Banda_Mbps),
             "f": bool(r.Disponible),
         }
         for r in df.itertuples()
-    }
+    })
+    red.routers = {k: float(v) for k, v in (pesos_routers or {}).items()}
+    red.delta = float(delta)
+    positivos = [w for w in red.routers.values() if w > 0]
+    red.w_ref = max(positivos) if positivos else 1.0
+    return red
 
 
 def metricas_camino(camino, enlaces, d_ref, b_ref, alfa, beta, gamma):
     tramos = list(zip(camino[:-1], camino[1:]))
     datos = [enlaces[frozenset(t)] for t in tramos]
     costos = [costo_arista(x["d"], x["b"], alfa, beta, gamma, d_ref, b_ref) for x in datos]
+    w = getattr(enlaces, "routers", {})
+    delta = getattr(enlaces, "delta", 0.0)
+    w_ref = getattr(enlaces, "w_ref", 1.0)
+    pen_routers = [delta * (w.get(u, 0.0) + w.get(v, 0.0)) / (2 * w_ref) for u, v in tramos]
     return {
         "Disponible": all(x["f"] for x in datos),
         "Saltos": len(tramos),
         "Retardo_ms": sum(x["d"] for x in datos),
         "Banda_min_Mbps": min(x["b"] for x in datos),
         "Costo_multicriterio": sum(costos),
+        "Peso_routers": sum(w.get(n, 0.0) for n in camino),
+        "Costo_adaptativo": sum(costos) + sum(pen_routers),
     }
 
 
@@ -172,10 +220,12 @@ def valor_objetivo(modo, m):
         return float(m["Saltos"])
     if modo == MODO_RETARDO:
         return float(m["Retardo_ms"])
+    if modo == MODO_ADAPT:
+        return float(m["Costo_adaptativo"])
     return float(m["Costo_multicriterio"])
 
 
-def construir_grafo(df, modo, alfa, beta, gamma, d_ref, b_ref):
+def construir_grafo(df, modo, alfa, beta, gamma, d_ref, b_ref, red=None):
     """Grafo solo con enlaces disponibles; 'peso' es el costo de la función objetivo."""
     G = nx.Graph()
     G.add_nodes_from(NODOS)
@@ -189,6 +239,10 @@ def construir_grafo(df, modo, alfa, beta, gamma, d_ref, b_ref):
             w = d
         else:
             w = costo_arista(d, b, alfa, beta, gamma, d_ref, b_ref)
+            if modo == MODO_ADAPT and red is not None:
+                # los routers intermedios cuentan completos: cada extremo aporta la mitad
+                wr = red.routers
+                w += red.delta * (wr.get(r.Origen, 0.0) + wr.get(r.Destino, 0.0)) / (2 * red.w_ref)
             if not math.isfinite(w):
                 continue  # capacidad 0: inutilizable en el modelo multicriterio
         G.add_edge(r.Origen, r.Destino, peso=w)
@@ -254,26 +308,39 @@ def _base_figura(df, mostrar_etiquetas=True, tenue=False):
     return fig
 
 
-def _agregar_nodos(fig, alcanzables=None):
-    colores, textos = [], []
+def _agregar_nodos(fig, alcanzables=None, red=None, caidos=()):
+    w = red.routers if red is not None else {}
+    w_ref = red.w_ref if red is not None else 1.0
+    colores, tamanos, hover, pesos_txt = [], [], [], []
     for n in NODOS:
-        if n == ORIGEN:
-            colores.append("#2b6cb0")
+        if n in caidos:
+            col = "#d64545"
+        elif n == ORIGEN:
+            col = "#2b6cb0"
         elif n == DESTINO:
-            colores.append("#dd6b20")
+            col = "#dd6b20"
         elif alcanzables is not None and n not in alcanzables:
-            colores.append("#b0b0b0")
+            col = "#b0b0b0"
         else:
-            colores.append("#4a5568")
-        textos.append(n)
+            col = "#4a5568"
+        peso = w.get(n, 0.0)
+        colores.append(col)
+        tamanos.append(34 + 22 * peso / w_ref)  # más grande = router con más peso
+        pesos_txt.append(f"w={peso:g}" if peso > 0 else "")
+        hover.append(f"Router {n} · peso {peso:g}" + (" · caído" if n in caidos else ""))
     fig.add_trace(go.Scatter(
         x=[POS[n][0] for n in NODOS], y=[POS[n][1] for n in NODOS],
-        mode="markers+text", text=textos, textposition="middle center",
-        textfont=dict(color="white", size=14),
-        marker=dict(size=34, color=colores, line=dict(color="white", width=2)),
-        showlegend=False, hoverinfo="text",
-        hovertext=[f"Router {n}" for n in NODOS],
+        mode="markers+text", text=[n + ("✖" if n in caidos else "") for n in NODOS],
+        textposition="middle center", textfont=dict(color="white", size=14),
+        marker=dict(size=tamanos, color=colores, line=dict(color="white", width=2)),
+        showlegend=False, hoverinfo="text", hovertext=hover,
     ))
+    if any(pesos_txt):
+        fig.add_trace(go.Scatter(
+            x=[POS[n][0] for n in NODOS], y=[POS[n][1] - 0.38 for n in NODOS],
+            mode="text", text=pesos_txt, textfont=dict(size=11, color="#b7410e"),
+            showlegend=False, hoverinfo="skip",
+        ))
 
 
 def _formato(fig, titulo):
@@ -287,7 +354,7 @@ def _formato(fig, titulo):
     return fig
 
 
-def figura_rutas(df, c_opt, c_est):
+def figura_rutas(df, c_opt, c_est, red=None, caidos=()):
     fig = _base_figura(df)
     if c_est:
         xs, ys = _segmentos(c_est)
@@ -299,11 +366,11 @@ def figura_rutas(df, c_opt, c_est):
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", line=dict(color="#1a9850", width=5),
             name="Ruta óptima recalculada", hoverinfo="skip"))
-    _agregar_nodos(fig)
+    _agregar_nodos(fig, red=red, caidos=caidos)
     return _formato(fig, "Topología, ruta estática y ruta óptima H → B")
 
 
-def figura_sink_tree(df, caminos):
+def figura_sink_tree(df, caminos, red=None, caidos=()):
     fig = _base_figura(df, mostrar_etiquetas=False, tenue=True)
     for n, cam in caminos.items():
         if n == DESTINO:
@@ -318,7 +385,7 @@ def figura_sink_tree(df, caminos):
             showarrow=True, arrowhead=3, arrowsize=1.4, arrowwidth=3.5,
             arrowcolor="#1a9850",
         )
-    _agregar_nodos(fig, alcanzables=set(caminos.keys()))
+    _agregar_nodos(fig, alcanzables=set(caminos.keys()), red=red, caidos=caidos)
     fig = _formato(fig, "Sink Tree T_B: un único siguiente salto de cada router hacia B")
     return fig
 
@@ -355,22 +422,35 @@ with st.sidebar:
             "Con los pesos por defecto: saltos → H–D–A–B, retardo → H–E–J–C–B, "
             "multicriterio → H–O–N–J–C–B."
         )
+    elif escenario == ESC_ADAPT:
+        st.caption(
+            "Multicriterio ignora los routers → H–D–A–B. Adaptativo (δ>0): D y A pesan "
+            "mucho y la ruta pasa a H–E–J–C–B."
+        )
     else:
-        st.caption("Al cambiar de escenario se pierden las ediciones manuales de la tabla.")
+        st.caption("Al cambiar de escenario se pierden las ediciones manuales de las tablas.")
 
     modo = st.radio("Función objetivo", MODOS, index=0, key=f"modo_{n_reset}")
-    es_multi = modo == MODO_MULTI
+    es_adapt = modo == MODO_ADAPT
+    es_multi = modo in (MODO_MULTI, MODO_ADAPT)
 
     st.markdown("**Pesos (solo multicriterio)**")
     alfa_in = st.slider("α  (saltos)", 0.0, 1.0, 0.50, 0.05, key=f"alfa_{n_reset}", disabled=not es_multi)
     beta_in = st.slider("β  (demora)", 0.0, 1.0, 0.35, 0.05, key=f"beta_{n_reset}", disabled=not es_multi)
     gamma_in = st.slider("γ  (baja capacidad)", 0.0, 1.0, 0.15, 0.05, key=f"gamma_{n_reset}", disabled=not es_multi)
 
-    alfa, beta, gamma, suma_nula = normalizar_pesos(alfa_in, beta_in, gamma_in)
+    delta_in = st.slider("δ  (peso de routers, solo adaptativo)", 0.0, 1.0, 0.80, 0.05,
+                         key=f"delta_{n_reset}", disabled=not es_adapt)
+
+    alfa, beta, gamma, delta, suma_nula = normalizar_pesos(
+        alfa_in, beta_in, gamma_in, delta_in if es_adapt else None)
     if es_multi:
         if suma_nula:
-            st.warning("Los tres pesos son 0: se usan α=β=γ=1/3.")
-        st.caption(f"Pesos normalizados: α={alfa:.4f}, β={beta:.4f}, γ={gamma:.4f}")
+            st.warning("Todos los pesos son 0: se reparten por igual.")
+        pesos_txt = f"α={alfa:.4f}, β={beta:.4f}, γ={gamma:.4f}"
+        if es_adapt:
+            pesos_txt += f", δ={delta:.4f}"
+        st.caption("Pesos normalizados: " + pesos_txt)
 
 # ---------------- Sección 1: tabla de enlaces ----------------
 st.header("1. Tabla de enlaces")
@@ -395,8 +475,34 @@ if errores:
         st.error(e)
     st.stop()
 
+st.subheader("Tabla de routers")
+st.caption(
+    "Peso_router: costo del router (procesamiento, congestión, prioridad); 0 = sin penalización. "
+    "Solo se usa en el modo Adaptativo. Un router no disponible deja inutilizados sus enlaces."
+)
+dfr_ed = st.data_editor(
+    tabla_routers(escenario),
+    key=f"routers_{n_reset}_{idx_esc}",
+    hide_index=True,
+    num_rows="fixed",
+    disabled=["Router"],
+    column_config={
+        "Peso_router": st.column_config.NumberColumn("Peso_router", min_value=0.0, step=1.0),
+        "Disponible": st.column_config.CheckboxColumn("Disponible"),
+    },
+)
+dfr, errores_r = limpiar_routers(dfr_ed)
+if errores_r:
+    for e in errores_r:
+        st.error(e)
+    st.stop()
+
+caidos = set(dfr.loc[~dfr["Disponible"], "Router"])
+df_ef = df.copy()  # enlace efectivo: disponible y con ambos routers activos
+df_ef["Disponible"] = df["Disponible"] & ~df["Origen"].isin(caidos) & ~df["Destino"].isin(caidos)
+
 d_ref, b_ref = referencias(df)
-enlaces = dic_enlaces(df)
+enlaces = dic_enlaces(df_ef, dict(zip(dfr["Router"], dfr["Peso_router"])), delta)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("d_ref (ms)", f"{d_ref:g}")
@@ -409,7 +515,7 @@ if es_multi and (df["Banda_Mbps"] <= 0).any():
     st.warning("Hay enlaces con 0 Mbps: en el modelo multicriterio b_ref/b_ij no está definido y esos enlaces se excluyen del cálculo.")
 
 # ---------------- Cálculos principales ----------------
-G = construir_grafo(df, modo, alfa, beta, gamma, d_ref, b_ref)
+G = construir_grafo(df_ef, modo, alfa, beta, gamma, d_ref, b_ref, enlaces)
 c_opt = camino_optimo(G)
 
 filas_rutas = []
@@ -444,16 +550,22 @@ if modo == MODO_SALTOS:
     st.latex(r"\min_{P}\; H(P)=\sum_{(i,j)\in P} h_{ij},\qquad h_{ij}=1")
 elif modo == MODO_RETARDO:
     st.latex(r"\min_{P}\; D(P)=\sum_{(i,j)\in P} d_{ij}")
-else:
+elif modo == MODO_MULTI:
     st.latex(
         r"\min_{P}\; C(P)=\sum_{(i,j)\in P}\left[\alpha+\beta\,\frac{d_{ij}}{d_{ref}}"
         r"+\gamma\,\frac{b_{ref}}{b_{ij}}\right],\qquad \alpha+\beta+\gamma=1"
+    )
+else:
+    st.latex(
+        r"\min_{P}\; C_a(P)=\sum_{(i,j)\in P}\left[\alpha+\beta\,\frac{d_{ij}}{d_{ref}}"
+        r"+\gamma\,\frac{b_{ref}}{b_{ij}}+\delta\,\frac{w_i+w_j}{2\,w_{ref}}\right],"
+        r"\qquad \alpha+\beta+\gamma+\delta=1"
     )
 st.latex(r"B(P)=\min_{(i,j)\in P} b_{ij}\qquad(\text{capacidad del camino; no es la penalización } b_{ref}/b_{ij})")
 
 col_fig, col_res = st.columns([3, 2])
 with col_fig:
-    st.plotly_chart(figura_rutas(df, c_opt, c_est))
+    st.plotly_chart(figura_rutas(df_ef, c_opt, c_est, enlaces, caidos))
 with col_res:
     st.subheader("Ruta estática (artículo)")
     if c_est:
@@ -515,12 +627,14 @@ with st.expander("Desglose por arista (para el cálculo manual)"):
         c_term_a = alfa
         c_term_b = beta * x["d"] / d_ref
         c_term_g = gamma * b_ref / x["b"] if x["b"] > 0 else math.inf
+        c_term_w = enlaces.delta * (enlaces.routers.get(u, 0.0) + enlaces.routers.get(v, 0.0)) / (2 * enlaces.w_ref)
         filas.append({
             "Enlace": f"{u}–{v}", "d_ij (ms)": x["d"], "b_ij (Mbps)": x["b"],
             "Disponible": x["f"], "α": round(c_term_a, 4),
             "β·d/d_ref": round(c_term_b, 4),
             "γ·b_ref/b": round(c_term_g, 4) if math.isfinite(c_term_g) else "∞",
-            "C_ij": round(c_term_a + c_term_b + c_term_g, 4) if math.isfinite(c_term_g) else "∞",
+            "δ·(w_i+w_j)/2w_ref": round(c_term_w, 4),
+            "C_ij": round(c_term_a + c_term_b + c_term_g + c_term_w, 4) if math.isfinite(c_term_g) else "∞",
         })
     desglose = pd.DataFrame(filas)
     st.dataframe(desglose, hide_index=True)
@@ -558,7 +672,7 @@ tabla_tree = pd.DataFrame(filas_tree)
 
 col_t1, col_t2 = st.columns([3, 2])
 with col_t1:
-    st.plotly_chart(figura_sink_tree(df, caminos))
+    st.plotly_chart(figura_sink_tree(df_ef, caminos, enlaces, caidos))
 with col_t2:
     st.dataframe(tabla_tree[["Router", "Siguiente_salto", "Camino_hacia_B", "Valor_objetivo"]], hide_index=True)
     st.caption(
@@ -603,6 +717,8 @@ definiciones = pd.DataFrame(
         ("C(P)", "Costo multicriterio normalizado", "adimensional"),
         ("α, β, γ", "Pesos de saltos, demora y baja capacidad", "adimensional"),
         ("d_ref, b_ref", "Máximos positivos de retardo y capacidad en la tabla actual", "ms, Mbps"),
+        ("w_r", "Peso del router r (procesamiento, congestión, prioridad)", "adimensional"),
+        ("δ", "Peso de los routers en el modo adaptativo", "adimensional"),
         ("T_B", "Árbol de siguientes saltos hacia B", "—"),
     ],
     columns=["Símbolo", "Definición", "Unidad"],
@@ -612,7 +728,7 @@ st.dataframe(definiciones, hide_index=True)
 # CSV de resultados (rutas + Sink Tree en un solo archivo)
 contexto = {
     "Funcion_objetivo": modo, "alfa": round(alfa, 6), "beta": round(beta, 6),
-    "gamma": round(gamma, 6), "d_ref_ms": d_ref, "b_ref_Mbps": b_ref,
+    "gamma": round(gamma, 6), "delta": round(delta, 6), "d_ref_ms": d_ref, "b_ref_Mbps": b_ref,
 }
 filas_csv = []
 for _, r in tabla_rutas.iterrows():
