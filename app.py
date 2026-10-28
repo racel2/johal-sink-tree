@@ -69,13 +69,39 @@ MODOS = [MODO_SALTOS, MODO_RETARDO, MODO_MULTI]
 # ----------------------------------------------------------------------------
 # 2. LÓGICA (sin dependencia de la interfaz)
 # ----------------------------------------------------------------------------
-def tabla_inicial() -> pd.DataFrame:
+# Escenarios de prueba: {(origen, destino): {columna: valor}} sobre la tabla base
+ESCENARIOS = {
+    "Base (datos del artículo)": {},
+    "B. Retardo H–D = 40 ms": {("H", "D"): {"Retardo_ms": 40}},
+    "C. Falla H–D": {("H", "D"): {"Disponible": False}},
+    "D. Fallan H–D y H–E": {
+        ("H", "D"): {"Disponible": False},
+        ("H", "E"): {"Disponible": False},
+    },
+    "E. Cuello de botella E–J = 5 Mbps": {("E", "J"): {"Banda_Mbps": 5}},
+    "Demo: cada criterio elige una ruta distinta": {
+        ("H", "D"): {"Retardo_ms": 40, "Banda_Mbps": 20},
+        ("D", "A"): {"Banda_Mbps": 20},
+        ("A", "B"): {"Banda_Mbps": 20},
+        ("H", "E"): {"Banda_Mbps": 10},
+        ("E", "J"): {"Banda_Mbps": 10},
+        ("H", "O"): {"Banda_Mbps": 100},
+    },
+}
+NOMBRES_ESCENARIOS = list(ESCENARIOS.keys())
+
+
+def tabla_inicial(escenario: str = "Base (datos del artículo)") -> pd.DataFrame:
     df = pd.DataFrame(
         ENLACES_BASE, columns=["Origen", "Destino", "Retardo_ms", "Banda_Mbps"]
     )
     df["Retardo_ms"] = df["Retardo_ms"].astype(float)
     df["Banda_Mbps"] = df["Banda_Mbps"].astype(float)
     df["Disponible"] = True
+    for (u, v), cambios in ESCENARIOS.get(escenario, {}).items():
+        fila = (df["Origen"] == u) & (df["Destino"] == v)
+        for col, valor in cambios.items():
+            df.loc[fila, col] = valor
     return df
 
 
@@ -320,6 +346,18 @@ with st.sidebar:
         st.session_state["reset_n"] += 1
         st.rerun()
 
+    escenario = st.selectbox(
+        "Escenario de prueba (carga la tabla)", NOMBRES_ESCENARIOS, key=f"esc_{n_reset}"
+    )
+    idx_esc = NOMBRES_ESCENARIOS.index(escenario)
+    if escenario.startswith("Demo"):
+        st.caption(
+            "Con los pesos por defecto: saltos → H–D–A–B, retardo → H–E–J–C–B, "
+            "multicriterio → H–O–N–J–C–B."
+        )
+    else:
+        st.caption("Al cambiar de escenario se pierden las ediciones manuales de la tabla.")
+
     modo = st.radio("Función objetivo", MODOS, index=0, key=f"modo_{n_reset}")
     es_multi = modo == MODO_MULTI
 
@@ -339,8 +377,8 @@ st.header("1. Tabla de enlaces")
 st.write("Edite **Retardo_ms**, **Banda_Mbps** y **Disponible** directamente en la tabla.")
 
 df_editado = st.data_editor(
-    tabla_inicial(),
-    key=f"editor_{n_reset}",
+    tabla_inicial(escenario),
+    key=f"editor_{n_reset}_{idx_esc}",
     hide_index=True,
     num_rows="fixed",
     disabled=["Origen", "Destino"],
